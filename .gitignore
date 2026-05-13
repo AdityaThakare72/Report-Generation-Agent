@@ -25,9 +25,8 @@ build/
 # ──────────────────────────────────────────────
 # Generated Output
 # ──────────────────────────────────────────────
-*.pdf
-!Agent_4_Report_Generation_Assignment.pdf
-output/
+
+
 
 # ──────────────────────────────────────────────
 # Logs & OS artifacts

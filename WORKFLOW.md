@@ -127,7 +127,7 @@ class AgentState(TypedDict):
    - Recommend next steps (EDD, STR filing, monitoring)
    - Stay within 250–350 words
    - **Never fabricate numbers**
-3. Calls `ChatGoogleGenerativeAI(model="gemini-2.0-flash")` with `temperature=0.3` for controlled output.
+3. Calls `ChatGoogleGenerativeAI(model="gemini-2.5-flash")` with `temperature=0.3` for controlled output.
 4. Extracts the text response.
 
 **State Update:**

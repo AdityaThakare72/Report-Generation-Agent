@@ -1,30 +1,20 @@
 """
-src/data_generator.py
-─────────────────────
-Fabricates 50 rows of realistic financial transaction data for
-testing the AI Compliance Monitoring SAR pipeline.
+Synthetic financial transaction data generator.
 
-Run directly:
+Produces 50 rows of realistic Indian financial transactions for testing
+the SAR pipeline. Key properties of the output:
+  - ~30% flagged (high-risk) for meaningful SAR content
+  - ~10% missing risk_score/kyc_status for imputation testing
+  - Log-normal amount distribution (many small, few large)
+  - Indian names, IFSC codes, INR-denominated amounts
+
+Usage:
     python -m src.data_generator
-
-Output:
-    data/sample_transactions.json
-
-Design decisions:
-    • ~30 % of transactions are intentionally flagged (high-risk)
-      to produce meaningful SAR narratives.
-    • ~10 % of records have missing risk_score / kyc_status to
-      exercise Node 3 (Missing Data Handler).
-    • Amounts follow a log-normal distribution to mimic real
-      financial transaction patterns (many small, few very large).
-    • Indian names, IFSC codes, and INR-denominated amounts give
-      the data an RBI/SEBI regulatory flavour.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import random
 from datetime import datetime, timedelta
@@ -40,14 +30,9 @@ from src.models import (
     TransactionType,
 )
 
-# ──────────────────────────────────────────────────────────────────────
-# Constants & Reference Data
-# ──────────────────────────────────────────────────────────────────────
+NUM_TRANSACTIONS = 50
 
-NUM_TRANSACTIONS: int = 50
-
-# Realistic Indian names
-CUSTOMER_NAMES: list[str] = [
+CUSTOMER_NAMES = [
     "Rajesh Kumar Sharma", "Priya Nair", "Amit Patel",
     "Sunita Devi Gupta", "Vikram Singh Chauhan", "Ananya Iyer",
     "Mohammed Farooq Sheikh", "Deepa Krishnamurthy", "Arjun Reddy",
@@ -59,7 +44,7 @@ CUSTOMER_NAMES: list[str] = [
     "Prakash Chandra Das",
 ]
 
-COUNTERPARTY_NAMES: list[str] = [
+COUNTERPARTY_NAMES = [
     "Offshore Holdings Ltd", "Global Trade FZE",
     "Pinnacle Investments LLC", "Star Exports Pvt Ltd",
     "Diamond Bullion Traders", "Zenith Capital Partners",
@@ -70,21 +55,20 @@ COUNTERPARTY_NAMES: list[str] = [
     "Alpine Trust Holdings",
 ]
 
-# Sample IFSC-style codes
-BRANCH_CODES: list[str] = [
+BRANCH_CODES = [
     "HDFC0001234", "SBIN0005678", "ICIC0009012",
     "UTIB0003456", "KKBK0007890", "PUNB0002345",
     "BARB0006789", "CNRB0001111", "BKID0002222",
     "IOBA0003333",
 ]
 
-COUNTERPARTY_BANKS: list[str] = [
+COUNTERPARTY_BANKS = [
     "HSBC0005678", "CITI0001234", "SCBL0009876",
     "DBSS0004321", "BARB0008765", "SBIN0001111",
     "ICIC0002222",
 ]
 
-FLAG_REASONS: list[str] = [
+FLAG_REASONS = [
     "Large outward remittance to high-risk jurisdiction",
     "Structuring — multiple deposits just below ₹10L threshold",
     "Rapid movement of funds (round-tripping suspected)",
@@ -97,11 +81,12 @@ FLAG_REASONS: list[str] = [
     "Cross-border transfer to sanctioned country",
 ]
 
+# Weighted distribution: ~60% Verified, ~20% Pending, ~10% Expired, ~10% None
 KYC_STATUSES: list[str | None] = [
-    "Verified", "Verified", "Verified", "Verified",  # 60 % verified
-    "Pending", "Pending",                             # 20 % pending
-    "Expired",                                        # 10 % expired
-    None,                                             # 10 % missing
+    "Verified", "Verified", "Verified", "Verified",
+    "Pending", "Pending",
+    "Expired",
+    None,
 ]
 
 REMARKS_POOL: list[str | None] = [
@@ -110,30 +95,19 @@ REMARKS_POOL: list[str | None] = [
     "Customer provided supporting documentation",
     "Pending clarification from branch",
     "Cleared after secondary review",
-    None, None, None,  # ~37.5 % chance of no remark
+    None, None, None,
 ]
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Helper functions
-# ──────────────────────────────────────────────────────────────────────
-
 def _random_amount() -> float:
-    """
-    Generate a log-normally distributed transaction amount in INR.
-    Most transactions cluster around ₹50K–₹5L, with occasional
-    outliers up to ₹2Cr+.
-    """
-    raw: float = random.lognormvariate(mu=12.0, sigma=1.5)
-    # Clamp between ₹5,000 and ₹5,00,00,000 (5 Cr)
-    clamped: float = max(5_000.0, min(raw, 5_00_00_000.0))
-    return round(clamped, 2)
+    """Log-normal distribution: clusters around ₹50K–₹5L, outliers up to ₹2Cr+."""
+    raw = random.lognormvariate(mu=12.0, sigma=1.5)
+    return round(max(5_000.0, min(raw, 5_00_00_000.0)), 2)
 
 
 def _random_date() -> datetime:
-    """Generate a random datetime in the last 90 days."""
-    now: datetime = datetime.now()
-    delta: timedelta = timedelta(
+    now = datetime.now()
+    delta = timedelta(
         days=random.randint(0, 90),
         hours=random.randint(0, 23),
         minutes=random.randint(0, 59),
@@ -142,22 +116,15 @@ def _random_date() -> datetime:
 
 
 def _generate_risk_score(is_flagged: bool) -> float | None:
-    """
-    Generate a risk score.
-    • Flagged transactions skew 60–100.
-    • Non-flagged transactions skew 0–50.
-    • ~10 % of all records return None (missing).
-    """
+    """Flagged → 60–100, unflagged → 0–50. ~10% return None to test imputation."""
     if random.random() < 0.10:
-        return None  # Intentionally missing
-
+        return None
     if is_flagged:
         return round(random.uniform(60.0, 100.0), 1)
     return round(random.uniform(0.0, 50.0), 1)
 
 
 def _risk_level_from_score(score: float | None) -> RiskLevel | None:
-    """Derive categorical risk level from a numeric score."""
     if score is None:
         return None
     if score >= 80:
@@ -169,27 +136,21 @@ def _risk_level_from_score(score: float | None) -> RiskLevel | None:
     return RiskLevel.LOW
 
 
-def _generate_single_transaction(index: int) -> dict[str, Any]:
-    """
-    Build a single transaction dict.
+def _build_transaction(index: int) -> dict[str, Any]:
+    """Build a single transaction dict. ~30% flagged, ~8% PEP."""
+    is_flagged = random.random() < 0.30
+    is_pep = random.random() < 0.08
+    risk_score = _generate_risk_score(is_flagged)
+    risk_level = _risk_level_from_score(risk_score)
 
-    Approximately 30 % of transactions are flagged to ensure
-    the SAR report has meaningful content to analyse.
-    """
-    is_flagged: bool = random.random() < 0.30
-    is_pep: bool = random.random() < 0.08  # ~8 % PEP rate
-
-    risk_score: float | None = _generate_risk_score(is_flagged)
-    risk_level: RiskLevel | None = _risk_level_from_score(risk_score)
-
-    # Occasionally use a non-INR currency for cross-border flavour
-    currency: Currency = (
+    # ~15% non-INR for cross-border variety
+    currency = (
         random.choice([Currency.USD, Currency.EUR, Currency.GBP, Currency.AED, Currency.SGD])
         if random.random() < 0.15
         else Currency.INR
     )
 
-    txn: dict[str, Any] = {
+    return {
         "transaction_id": f"TXN-{index:05d}",
         "account_id": f"ACC-{random.randint(10_000_000, 99_999_999)}",
         "customer_name": random.choice(CUSTOMER_NAMES),
@@ -215,93 +176,46 @@ def _generate_single_transaction(index: int) -> dict[str, Any]:
         "remarks": random.choice(REMARKS_POOL),
     }
 
-    return txn
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Main generation logic
-# ──────────────────────────────────────────────────────────────────────
-
-def generate_transaction_batch(
-    num_transactions: int = NUM_TRANSACTIONS,
-) -> TransactionBatch:
-    """
-    Generate a batch of synthetic transactions and validate
-    them through the Pydantic schema.
-
-    Returns:
-        TransactionBatch — fully validated batch ready for pipeline ingestion.
-
-    Raises:
-        pydantic.ValidationError — if any generated record fails validation
-        (indicates a bug in this generator, not user error).
-    """
-    raw_transactions: list[dict[str, Any]] = [
-        _generate_single_transaction(i + 1) for i in range(num_transactions)
-    ]
-
-    batch = TransactionBatch(
+def generate_transaction_batch(n: int = NUM_TRANSACTIONS) -> TransactionBatch:
+    """Generate and validate a batch of synthetic transactions."""
+    raw = [_build_transaction(i + 1) for i in range(n)]
+    return TransactionBatch(
         report_id=f"SAR-{datetime.now().strftime('%Y%m%d')}-001",
         reporting_entity="Compliance Division — ABC Financial Services",
         generated_at=datetime.now(),
-        transactions=[Transaction(**txn) for txn in raw_transactions],
+        transactions=[Transaction(**txn) for txn in raw],
     )
-
-    return batch
 
 
 def save_batch_to_json(batch: TransactionBatch, output_path: str | Path) -> Path:
-    """
-    Serialize a TransactionBatch to a pretty-printed JSON file.
+    """Serialize batch to pretty-printed JSON."""
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(batch.model_dump(mode="json"), f, indent=2, ensure_ascii=False, default=str)
+    return out.resolve()
 
-    Args:
-        batch: Validated transaction batch.
-        output_path: File path for the output JSON.
-
-    Returns:
-        Resolved Path of the written file.
-    """
-    output: Path = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output, "w", encoding="utf-8") as f:
-        json.dump(
-            batch.model_dump(mode="json"),
-            f,
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
-
-    return output.resolve()
-
-
-# ──────────────────────────────────────────────────────────────────────
-# CLI Entry Point
-# ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Generate sample data and write to data/sample_transactions.json."""
-    random.seed(42)  # Reproducible output
+    random.seed(42)
 
-    print("🏦  Generating synthetic financial transaction data...")
-    batch: TransactionBatch = generate_transaction_batch()
+    print("Generating synthetic transaction data...")
+    batch = generate_transaction_batch()
 
-    output_file: str = os.path.join("data", "sample_transactions.json")
-    saved_path: Path = save_batch_to_json(batch, output_file)
+    path = save_batch_to_json(batch, os.path.join("data", "sample_transactions.json"))
 
-    # ── Print summary statistics ─────────────────────────────────
-    total: int = len(batch.transactions)
-    flagged: int = sum(1 for t in batch.transactions if t.is_flagged)
-    missing_risk: int = sum(1 for t in batch.transactions if t.risk_score is None)
-    pep_count: int = sum(1 for t in batch.transactions if t.is_pep)
-    total_volume: float = sum(t.amount for t in batch.transactions)
+    total = len(batch.transactions)
+    flagged = sum(1 for t in batch.transactions if t.is_flagged)
+    missing = sum(1 for t in batch.transactions if t.risk_score is None)
+    pep = sum(1 for t in batch.transactions if t.is_pep)
+    volume = sum(t.amount for t in batch.transactions)
 
-    print(f"✅  Generated {total} transactions → {saved_path}")
-    print(f"    ├── Flagged:        {flagged} ({flagged/total*100:.0f}%)")
-    print(f"    ├── Missing risk:   {missing_risk} ({missing_risk/total*100:.0f}%)")
-    print(f"    ├── PEP accounts:   {pep_count}")
-    print(f"    └── Total volume:   ₹{total_volume:,.2f}")
+    print(f"Generated {total} transactions -> {path}")
+    print(f"  Flagged:       {flagged} ({flagged/total*100:.0f}%)")
+    print(f"  Missing risk:  {missing} ({missing/total*100:.0f}%)")
+    print(f"  PEP accounts:  {pep}")
+    print(f"  Total volume:  INR {volume:,.2f}")
 
 
 if __name__ == "__main__":

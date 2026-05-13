@@ -1,17 +1,8 @@
 """
-src/models.py
-─────────────
-Pydantic v2 schemas for financial transaction data used in the
-AI Compliance Monitoring — Suspicious Activity Report (SAR) pipeline.
+Pydantic v2 schemas for financial transaction data and regulatory field mappings.
 
-These models enforce strict data validation at the ingestion boundary
-(Node 1 — Field Mapper) and define the canonical field names used
-throughout the LangGraph pipeline.
-
-Regulatory context:
-    • RBI Master Direction – KYC (Know Your Customer) norms
-    • SEBI Circular on Anti-Money-Laundering Standards
-    • FATF Suspicious Transaction Reporting guidelines
+Defines the canonical data contract used throughout the SAR pipeline.
+Validation happens at the ingestion boundary (field mapper node).
 """
 
 from __future__ import annotations
@@ -23,12 +14,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Enumerations
-# ──────────────────────────────────────────────────────────────────────
-
 class TransactionType(str, enum.Enum):
-    """Classification of financial transaction types."""
     WIRE_TRANSFER = "wire_transfer"
     CASH_DEPOSIT = "cash_deposit"
     CASH_WITHDRAWAL = "cash_withdrawal"
@@ -41,7 +27,6 @@ class TransactionType(str, enum.Enum):
 
 
 class RiskLevel(str, enum.Enum):
-    """Risk classification for a transaction or entity."""
     LOW = "Low"
     MEDIUM = "Medium"
     HIGH = "High"
@@ -49,7 +34,6 @@ class RiskLevel(str, enum.Enum):
 
 
 class AccountType(str, enum.Enum):
-    """Type of bank account."""
     SAVINGS = "savings"
     CURRENT = "current"
     NRE = "nre"
@@ -58,7 +42,7 @@ class AccountType(str, enum.Enum):
 
 
 class Currency(str, enum.Enum):
-    """Supported ISO 4217 currency codes."""
+    """ISO 4217 currency codes supported by the pipeline."""
     INR = "INR"
     USD = "USD"
     EUR = "EUR"
@@ -67,125 +51,41 @@ class Currency(str, enum.Enum):
     SGD = "SGD"
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Core Transaction Schema
-# ──────────────────────────────────────────────────────────────────────
-
 class Transaction(BaseModel):
     """
-    A single financial transaction record.
-
-    Fields are aligned with RBI STR (Suspicious Transaction Report)
-    and SEBI AML reporting requirements.
+    Single financial transaction record, aligned with RBI STR
+    and SEBI AML reporting field requirements.
     """
 
-    # ── Identifiers ──────────────────────────────────────────────────
-    transaction_id: str = Field(
-        ...,
-        min_length=1,
-        description="Unique identifier for the transaction (e.g., TXN-00001).",
-    )
-    account_id: str = Field(
-        ...,
-        min_length=1,
-        description="Bank account number or internal account identifier.",
-    )
-    customer_name: str = Field(
-        ...,
-        min_length=1,
-        description="Full name of the account holder.",
-    )
+    transaction_id: str = Field(..., min_length=1)
+    account_id: str = Field(..., min_length=1)
+    customer_name: str = Field(..., min_length=1)
+    account_type: AccountType
+    branch_code: str = Field(..., min_length=1, description="Branch IFSC or internal code.")
 
-    # ── Account metadata ─────────────────────────────────────────────
-    account_type: AccountType = Field(
-        ...,
-        description="Type of bank account (savings, current, NRE, etc.).",
-    )
-    branch_code: str = Field(
-        ...,
-        min_length=1,
-        description="Branch IFSC or internal branch code.",
-    )
+    transaction_type: TransactionType
+    amount: float = Field(..., gt=0)
+    currency: Currency = Currency.INR
+    transaction_date: datetime
 
-    # ── Transaction details ──────────────────────────────────────────
-    transaction_type: TransactionType = Field(
-        ...,
-        description="Nature of the transaction.",
-    )
-    amount: float = Field(
-        ...,
-        gt=0,
-        description="Transaction amount (must be > 0).",
-    )
-    currency: Currency = Field(
-        default=Currency.INR,
-        description="ISO 4217 currency code.",
-    )
-    transaction_date: datetime = Field(
-        ...,
-        description="Timestamp of the transaction (ISO 8601).",
-    )
+    counterparty_name: Optional[str] = None
+    counterparty_account: Optional[str] = None
+    counterparty_bank: Optional[str] = None
 
-    # ── Counterparty ─────────────────────────────────────────────────
-    counterparty_name: Optional[str] = Field(
-        default=None,
-        description="Name of the receiving/sending party, if known.",
-    )
-    counterparty_account: Optional[str] = Field(
-        default=None,
-        description="Account identifier of the counterparty.",
-    )
-    counterparty_bank: Optional[str] = Field(
-        default=None,
-        description="Name or IFSC of the counterparty's bank.",
-    )
+    risk_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    risk_level: Optional[RiskLevel] = None
+    is_flagged: bool = False
+    flag_reason: Optional[str] = None
 
-    # ── Risk indicators ──────────────────────────────────────────────
-    risk_score: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        le=100.0,
-        description="ML-derived risk score (0–100). May be missing.",
-    )
-    risk_level: Optional[RiskLevel] = Field(
-        default=None,
-        description="Categorical risk level. Derived from risk_score or assigned by Node 3.",
-    )
-    is_flagged: bool = Field(
-        default=False,
-        description="Whether the transaction has been flagged by the AML engine.",
-    )
-    flag_reason: Optional[str] = Field(
-        default=None,
-        description="Human-readable reason for the flag.",
-    )
-
-    # ── KYC / PEP ────────────────────────────────────────────────────
-    is_pep: bool = Field(
-        default=False,
-        description="Is the customer a Politically Exposed Person?",
-    )
-    kyc_status: Optional[str] = Field(
-        default=None,
-        description="KYC verification status (e.g., 'Verified', 'Pending', 'Expired').",
-    )
-
-    # ── Additional context ───────────────────────────────────────────
-    remarks: Optional[str] = Field(
-        default=None,
-        description="Free-text remarks from the compliance officer.",
-    )
-
-    # ── Validators ───────────────────────────────────────────────────
+    is_pep: bool = False
+    kyc_status: Optional[str] = None
+    remarks: Optional[str] = None
 
     @field_validator("transaction_id")
     @classmethod
     def validate_transaction_id(cls, v: str) -> str:
-        """Ensure transaction IDs follow the expected format."""
         if not v.startswith("TXN-"):
-            raise ValueError(
-                f"transaction_id must start with 'TXN-', got '{v}'"
-            )
+            raise ValueError(f"transaction_id must start with 'TXN-', got '{v}'")
         return v
 
     class Config:
@@ -214,42 +114,16 @@ class Transaction(BaseModel):
         }
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Batch Input Schema
-# ──────────────────────────────────────────────────────────────────────
-
 class TransactionBatch(BaseModel):
-    """
-    A batch of transactions submitted for SAR analysis.
+    """Top-level schema for a batch of transactions submitted for SAR analysis."""
 
-    This is the top-level schema expected by Node 1 (Field Mapper).
-    """
-
-    report_id: str = Field(
-        ...,
-        description="Unique identifier for this SAR processing run.",
-    )
-    reporting_entity: str = Field(
-        default="Compliance Division — ABC Financial Services",
-        description="Name of the entity filing the report.",
-    )
-    generated_at: datetime = Field(
-        default_factory=datetime.now,
-        description="Timestamp when the batch was generated.",
-    )
-    transactions: list[Transaction] = Field(
-        ...,
-        min_length=1,
-        description="List of transactions to analyse.",
-    )
+    report_id: str
+    reporting_entity: str = "Compliance Division — ABC Financial Services"
+    generated_at: datetime = Field(default_factory=datetime.now)
+    transactions: list[Transaction] = Field(..., min_length=1)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Regulatory Field Mapping (used by Node 1)
-# ──────────────────────────────────────────────────────────────────────
-
-# Maps internal field names → regulatory report field names
-# as expected in RBI STR / SEBI AML filings.
+# Internal field names → regulatory report field names (RBI STR / SEBI AML)
 REGULATORY_FIELD_MAP: dict[str, str] = {
     "transaction_id": "STR Reference Number",
     "account_id": "Account Number",

@@ -1,17 +1,14 @@
 """
-src/tools.py
-────────────
-Standalone tool functions used by the LangGraph agent nodes.
+Business logic for the SAR pipeline nodes.
 
-Each function is a pure, deterministic utility — no LLM calls happen here.
-This separation keeps the agent graph nodes thin (orchestration only)
-and makes the business logic independently testable.
+Pure functions with no LLM calls — keeps the graph nodes thin and
+makes the logic independently testable.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
+import os
 import subprocess
 import tempfile
 from datetime import datetime
@@ -21,128 +18,111 @@ from typing import Any
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-_TEMPLATE_DIR: Path = Path(__file__).parent / "templates"
+_TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  1. AGGREGATION (Node 2)
-# ══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Aggregation (used by the aggregator node)
+# ---------------------------------------------------------------------------
 
 def aggregate_metrics(transactions: list[dict[str, Any]]) -> dict[str, Any]:
-    """
-    Compute summary metrics from transaction dicts using Pandas.
-    No LLM calls — all computation is deterministic.
-    """
-    df: pd.DataFrame = pd.DataFrame(transactions)
+    """Compute summary metrics over a list of transaction dicts using Pandas."""
+    df = pd.DataFrame(transactions)
 
-    total_transactions: int = len(df)
-    flagged_count: int = int(df["is_flagged"].sum())
-    pep_count: int = int(df["is_pep"].sum())
-    missing_risk_count: int = int(df["risk_score"].isna().sum())
+    total = len(df)
+    flagged_count = int(df["is_flagged"].sum())
+    flagged_df = df[df["is_flagged"] == True]  # noqa: E712
 
-    total_volume: float = round(float(df["amount"].sum()), 2)
-    avg_transaction: float = round(float(df["amount"].mean()), 2)
-    max_transaction: float = round(float(df["amount"].max()), 2)
-    min_transaction: float = round(float(df["amount"].min()), 2)
+    risk_dist = df["risk_level"].dropna().value_counts().to_dict()
+    txn_types = df["transaction_type"].value_counts().to_dict()
+    kyc_dist = df["kyc_status"].fillna("Missing").value_counts().to_dict()
 
-    flagged_df: pd.DataFrame = df[df["is_flagged"] == True]  # noqa: E712
-    flagged_volume: float = round(float(flagged_df["amount"].sum()), 2) if len(flagged_df) > 0 else 0.0
-
-    risk_distribution: dict[str, int] = df["risk_level"].dropna().value_counts().to_dict()
-    txn_type_breakdown: dict[str, int] = df["transaction_type"].value_counts().to_dict()
-    kyc_breakdown: dict[str, int] = df["kyc_status"].fillna("Missing").value_counts().to_dict()
-
-    top_flag_reasons: list[dict[str, Any]] = []
-    if len(flagged_df) > 0:
-        reason_counts = flagged_df["flag_reason"].value_counts().head(5)
-        top_flag_reasons = [
-            {"reason": r, "count": int(c)} for r, c in reason_counts.items()
+    top_reasons: list[dict[str, Any]] = []
+    if len(flagged_df):
+        top_reasons = [
+            {"reason": r, "count": int(c)}
+            for r, c in flagged_df["flag_reason"].value_counts().head(5).items()
         ]
 
-    metrics: dict[str, Any] = {
-        "total_transactions": total_transactions,
+    metrics = {
+        "total_transactions": total,
         "flagged_count": flagged_count,
-        "flagged_percentage": round(flagged_count / total_transactions * 100, 1) if total_transactions > 0 else 0.0,
-        "pep_count": pep_count,
-        "missing_risk_count": missing_risk_count,
-        "total_volume": total_volume,
-        "avg_transaction": avg_transaction,
-        "max_transaction": max_transaction,
-        "min_transaction": min_transaction,
-        "flagged_volume": flagged_volume,
-        "risk_distribution": risk_distribution,
-        "txn_type_breakdown": txn_type_breakdown,
-        "kyc_breakdown": kyc_breakdown,
-        "top_flag_reasons": top_flag_reasons,
+        "flagged_percentage": round(flagged_count / total * 100, 1) if total else 0.0,
+        "pep_count": int(df["is_pep"].sum()),
+        "missing_risk_count": int(df["risk_score"].isna().sum()),
+        "total_volume": round(float(df["amount"].sum()), 2),
+        "avg_transaction": round(float(df["amount"].mean()), 2),
+        "max_transaction": round(float(df["amount"].max()), 2),
+        "min_transaction": round(float(df["amount"].min()), 2),
+        "flagged_volume": round(float(flagged_df["amount"].sum()), 2) if len(flagged_df) else 0.0,
+        "risk_distribution": risk_dist,
+        "txn_type_breakdown": txn_types,
+        "kyc_breakdown": kyc_dist,
+        "top_flag_reasons": top_reasons,
     }
 
-    logger.info(
-        "Aggregation complete — %d transactions, %d flagged, volume ₹%.2f",
-        total_transactions, flagged_count, total_volume,
-    )
+    log.info("Aggregated %d transactions, %d flagged, volume %.2f",
+             total, flagged_count, metrics["total_volume"])
     return metrics
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  2. MISSING DATA HANDLER (Node 3)
-# ══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Missing data imputation (used by the missing-data handler node)
+# ---------------------------------------------------------------------------
+
+_RISK_THRESHOLDS = [(80, "Critical"), (60, "High"), (35, "Medium")]
+
 
 def handle_missing_data(transactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Impute missing fields with sensible defaults and log warnings.
+    Fill missing fields with conservative regulatory defaults.
 
-    Rules (aligned with RBI/SEBI conservative defaults):
-        risk_score   → 50.0 (mid-range, triggers "Medium")
-        risk_level   → "Medium"
-        kyc_status   → "Pending"
-        counterparty → "UNKNOWN"
+    Defaults are intentionally cautious (e.g., unknown risk → Medium,
+    unknown KYC → Pending) so that gaps surface during review rather
+    than being silently dismissed.
     """
-    cleaned: list[dict[str, Any]] = []
-    imputation_log: list[str] = []
+    cleaned = []
+    warnings: list[str] = []
 
     for txn in transactions:
-        txn_id: str = txn.get("transaction_id", "UNKNOWN")
-        modified: dict[str, Any] = txn.copy()
+        rec = txn.copy()
+        tid = rec.get("transaction_id", "UNKNOWN")
 
-        if modified.get("risk_score") is None:
-            modified["risk_score"] = 50.0
-            modified["risk_level"] = "Medium"
-            imputation_log.append(f"  ⚠  {txn_id}: risk_score → 50.0 (Medium)")
-        elif modified.get("risk_level") is None:
-            score: float = modified["risk_score"]
-            if score >= 80:
-                modified["risk_level"] = "Critical"
-            elif score >= 60:
-                modified["risk_level"] = "High"
-            elif score >= 35:
-                modified["risk_level"] = "Medium"
-            else:
-                modified["risk_level"] = "Low"
-            imputation_log.append(f"  ⚠  {txn_id}: risk_level → '{modified['risk_level']}'")
+        if rec.get("risk_score") is None:
+            rec["risk_score"] = 50.0
+            rec["risk_level"] = "Medium"
+            warnings.append(f"  {tid}: risk_score -> 50.0 (Medium)")
+        elif rec.get("risk_level") is None:
+            score = rec["risk_score"]
+            level = "Low"
+            for threshold, label in _RISK_THRESHOLDS:
+                if score >= threshold:
+                    level = label
+                    break
+            rec["risk_level"] = level
+            warnings.append(f"  {tid}: risk_level -> '{level}'")
 
-        if modified.get("kyc_status") is None:
-            modified["kyc_status"] = "Pending"
-            imputation_log.append(f"  ⚠  {txn_id}: kyc_status → 'Pending'")
+        if rec.get("kyc_status") is None:
+            rec["kyc_status"] = "Pending"
+            warnings.append(f"  {tid}: kyc_status -> 'Pending'")
 
-        if modified.get("counterparty_name") is None:
-            modified["counterparty_name"] = "UNKNOWN"
-            imputation_log.append(f"  ⚠  {txn_id}: counterparty_name → 'UNKNOWN'")
+        if rec.get("counterparty_name") is None:
+            rec["counterparty_name"] = "UNKNOWN"
+            warnings.append(f"  {tid}: counterparty_name -> 'UNKNOWN'")
 
-        cleaned.append(modified)
+        cleaned.append(rec)
 
-    if imputation_log:
-        logger.warning("Missing data imputed in %d field(s):\n%s", len(imputation_log), "\n".join(imputation_log))
-    else:
-        logger.info("No missing data detected — all fields complete.")
+    if warnings:
+        log.warning("Imputed %d missing field(s):\n%s", len(warnings), "\n".join(warnings))
 
     return cleaned
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  3. PDF REPORT GENERATOR (Node 5)
-# ══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# PDF rendering (used by the report generator node)
+# ---------------------------------------------------------------------------
 
 def _render_html(
     narrative: str,
@@ -152,73 +132,65 @@ def _render_html(
 ) -> str:
     """Render the Jinja2 SAR template to an HTML string."""
     env = Environment(loader=FileSystemLoader(str(_TEMPLATE_DIR)), autoescape=True)
-    template = env.get_template("report_template.html")
+    tpl = env.get_template("report_template.html")
 
-    flagged_transactions: list[dict[str, Any]] = [
-        txn for txn in transactions if txn.get("is_flagged")
-    ]
-
-    return template.render(
+    flagged = [t for t in transactions if t.get("is_flagged")]
+    return tpl.render(
         report_id=report_id,
         generated_at=datetime.now().strftime("%d %B %Y, %H:%M IST"),
         narrative=narrative,
         metrics=metrics,
-        flagged_transactions=flagged_transactions,
+        flagged_transactions=flagged,
         total_transactions=len(transactions),
     )
 
 
-def _pdf_via_python(html_content: str, output_path: Path) -> None:
-    """Attempt PDF generation via the WeasyPrint Python API."""
+def _pdf_via_python(html: str, dest: Path) -> None:
     from weasyprint import HTML  # type: ignore[import-untyped]
-    HTML(string=html_content).write_pdf(str(output_path))
+    HTML(string=html).write_pdf(str(dest))
 
 
-def _pdf_via_cli(html_content: str, output_path: Path) -> None:
-    """Fallback: use the system `weasyprint` CLI binary (outside venv)."""
-    import os
+def _find_system_weasyprint() -> str | None:
+    """Locate the system weasyprint binary, skipping the venv wrapper."""
+    for path in ["/usr/bin/weasyprint", "/usr/local/bin/weasyprint"]:
+        if Path(path).is_file():
+            return path
 
-    # Prefer the system binary — the venv wrapper has the same cffi issue
-    weasyprint_bin: str | None = None
-    for candidate in ["/usr/bin/weasyprint", "/usr/local/bin/weasyprint"]:
-        if Path(candidate).is_file():
-            weasyprint_bin = candidate
-            break
+    # Search PATH excluding venv entries
+    venv = os.environ.get("VIRTUAL_ENV", "")
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if venv and entry.startswith(venv):
+            continue
+        candidate = Path(entry) / "weasyprint"
+        if candidate.is_file():
+            return str(candidate)
 
-    # Last resort: search PATH but skip venv entries
-    if not weasyprint_bin:
-        venv_prefix: str = os.environ.get("VIRTUAL_ENV", "")
-        for p in os.environ.get("PATH", "").split(os.pathsep):
-            if venv_prefix and p.startswith(venv_prefix):
-                continue
-            candidate_path = Path(p) / "weasyprint"
-            if candidate_path.is_file():
-                weasyprint_bin = str(candidate_path)
-                break
+    return None
 
-    if not weasyprint_bin:
+
+def _pdf_via_cli(html: str, dest: Path) -> None:
+    """Fallback: invoke the system weasyprint binary directly."""
+    binary = _find_system_weasyprint()
+    if not binary:
         raise RuntimeError(
             "WeasyPrint is not available as a Python import or system CLI. "
             "Install it with: sudo pacman -S weasyprint (Arch) or "
             "sudo apt install weasyprint (Debian/Ubuntu)."
         )
 
-    # Write HTML to a temporary file for the CLI
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".html", delete=False, encoding="utf-8"
-    ) as tmp:
-        tmp.write(html_content)
-        tmp_path: str = tmp.name
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as f:
+        f.write(html)
+        tmp = f.name
 
     try:
         result = subprocess.run(
-            [weasyprint_bin, tmp_path, str(output_path)],
+            [binary, tmp, str(dest)],
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(f"WeasyPrint CLI failed: {result.stderr}")
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        Path(tmp).unlink(missing_ok=True)
 
 
 def generate_pdf(
@@ -229,28 +201,23 @@ def generate_pdf(
     output_path: str | Path = "output/sar_report.pdf",
 ) -> Path:
     """
-    Render a Suspicious Activity Report as PDF.
+    Render a SAR as a styled PDF (Jinja2 → HTML → WeasyPrint → PDF).
 
-    Pipeline: Jinja2 (HTML) → WeasyPrint (PDF).
-
-    Uses the Python WeasyPrint API if available, otherwise falls back
-    to the system `weasyprint` CLI (common on Arch Linux where
-    venv cffi can have symbol mismatches with system pango/glib).
+    Falls back to the system weasyprint CLI when the Python API can't
+    load native libs (common in venvs on Arch due to cffi/pango mismatch).
     """
-    output: Path = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    dest = Path(output_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
-    html_content: str = _render_html(narrative, metrics, transactions, report_id)
+    html = _render_html(narrative, metrics, transactions, report_id)
 
-    # Strategy 1: Python API (fastest, works on most systems)
     try:
-        _pdf_via_python(html_content, output)
-        logger.info("PDF generated (Python API) → %s", output.resolve())
-        return output.resolve()
-    except (OSError, ImportError) as e:
-        logger.warning("WeasyPrint Python API unavailable (%s), trying CLI fallback...", e)
+        _pdf_via_python(html, dest)
+        log.info("PDF generated (python API) -> %s", dest.resolve())
+        return dest.resolve()
+    except (OSError, ImportError) as exc:
+        log.warning("WeasyPrint Python API unavailable (%s), trying CLI...", exc)
 
-    # Strategy 2: System CLI fallback
-    _pdf_via_cli(html_content, output)
-    logger.info("PDF generated (CLI fallback) → %s", output.resolve())
-    return output.resolve()
+    _pdf_via_cli(html, dest)
+    log.info("PDF generated (CLI fallback) -> %s", dest.resolve())
+    return dest.resolve()
